@@ -1,100 +1,164 @@
 #include <sys/socket.h>
-#include <sys/stat.h>
 #include <stdlib.h>
 #include <linux/limits.h>
 #include <unistd.h>
-#include <dirent.h>
+#include <fcntl.h>
 #include <string.h>
-#include <poll.h>
+#include <sys/file.h>
+#include <errno.h>
 
 #include "../inc/handler.h"
 #include "../inc/myerrors.h"
+#include "../inc/http.h"
 
 
-int handle_client(struct pollfd *client, char *req_filename, char *method, long *offset) {   
-    int client_socket = client->fd;
-    short revents = client->revents;
-    short events = client->events;
+int get_file_size(int fd, long *size) {
+    log_message(LOG_STEPS, "get_file_size()\n");
 
-    if ((revents & events) == 0) {
-        log_message(LOG_ERROR, "Unsupported operation(-s) on client with socket %d\n", client_socket);
-        return REVENT_ERR;
+    *size = lseek(fd, 0, SEEK_END);
+    if (*size == (off_t)-1)
+        return -1;
+
+    return 0;
+}
+
+
+int get_file_size_with_open(connection_t *conn, long *size) {
+    log_message(LOG_STEPS, "get_file_size_with_open()\n");
+
+    int fd = open(conn->path, O_RDONLY);
+    if (fd == -1) {
+        log_message(LOG_ERROR, "Error while opening file in process_file()\n");
+        send_error(conn, NOT_FOUND);  
+        conn->state = ERROR;
+
+        return -1;
+    }
+
+    *size = lseek(fd, 0, SEEK_END);
+    if (*size == (off_t)-1) {
+        log_message(LOG_ERROR, "Error while counting file size\n");
+        send_error(conn, INTERNAL_SERVER_ERROR);  
+        conn->state = ERROR;
+        close(fd);
+
+        return -1;
+    }
+
+    close(fd);
+    return 0;
+}
+
+
+int read_file(connection_t *conn) {
+    log_message(LOG_STEPS, "read_file()\n");
+
+    int fd = open(conn->path, O_RDONLY);
+    if (fd == -1) {
+        log_message(LOG_ERROR, "Error while opening file in process_file()\n");
+        send_error(conn, NOT_FOUND);  
+        conn->state = ERROR;
+
+        return -1;
+    }
+
+    flock(fd, LOCK_EX);
+
+    int ok = get_file_size(fd, &conn->resp_buffer.total);
+    if (!ok) {
+        log_message(LOG_ERROR, "Error while count file size\n");
+        send_error(conn, INTERNAL_SERVER_ERROR);                
+        conn->state = ERROR;
+
+        flock(fd, LOCK_UN);
+        close(fd);
+
+        return -1;
     }
     
-    if (revents & POLLIN) {
-        return read_request(client_socket, req_filename, method);
-    }
-    
-    if (revents & POLLOUT) {
-        int result = send_response(client_socket, req_filename, method, offset);
+    conn->resp_buffer.buffer = malloc(conn->resp_buffer.total);
+    if (!conn->resp_buffer.buffer) {
+        log_message(LOG_ERROR, "Error while allocate memory for file buffer\n");
+        send_error(conn, INTERNAL_SERVER_ERROR);                
+        conn->state = ERROR;
 
-        // Если все данные (заголовок или и данные тоже, не важно) переданы, можно закрыть соединение
-        if (result == OK && *offset == 0) {
-            close(client_socket);
-        }
+        flock(fd, LOCK_UN);
+        close(fd);
+
+        return -1;
+    }
+
+    ssize_t bytes = read(fd, conn->resp_buffer.buffer, conn->resp_buffer.total);
+    if (bytes <= conn->resp_buffer.total) {
+        log_message(LOG_ERROR, "Error while reading file\n");
+
+        send_error(conn, INTERNAL_SERVER_ERROR);
+        conn->state = ERROR;
+
+        flock(fd, LOCK_UN);
+        close(fd);
+
+        return -1;
+    }
+
+    flock(fd, LOCK_UN);
+    close(fd);
+
+    return 0;
+}
+
+
+void handle_client(connection_t *conn) {
+    log_message(LOG_STEPS, "handle_client()\n");
+
+    if (conn->state == READY_FOR_REQUEST) {
+        read_request(conn);
+    } else if (conn->state == READY_FOR_RESPONSE) {
+        send_response_file(conn);
     }
 }
 
 
-int read_request(int client_socket, char *req_filename, char *res_method) {
-    char buffer[1024];
-    char method[10], path[PATH_MAX], protocol[10];
+void read_request(connection_t *conn) {
+    log_message(LOG_STEPS, "read_request()\n");
 
-    // Получение запроса
-    if (recv(client_socket, buffer, sizeof(buffer), 0) <= 0) {
-        perror("Receive failed\n");
-        return OK;
+    ssize_t recv_bytes = recv(conn->socket, conn->req_buffer.buffer, MAX_REQUEST_SIZE_BYTES, 0);
+    if (recv_bytes <= 0) {
+        log_message(LOG_ERROR, "Receive HTTP request failed\n");
+        conn->state = ERROR;
+        return;
     }
 
-    // Парсинг запроса
-    sscanf(buffer, "%s %s %s", method, path, protocol);
-    
-    // Поддерживаются только GET и HEAD запросы
-    if (strcmp(method, "GET") != 0 && strcmp(method, "HEAD") != 0) {
-        send_error(client_socket, METHOD_NOT_ALLOWED);
-        return OK;
+    parse_http_request(conn);
+
+    log_message(LOG_DEBUG, "After parsing http request we have: state == %d, path == %s, method == %s\n", conn->state, conn->path, conn->method);
+
+    if (conn->state != COMPLETE && conn->state != ERROR) {
+        log_message(LOG_DEBUG, "Received method: %d\n", conn->method);
+        if (conn->method == HEAD)
+            send_response_headers(conn, -1);
+        else
+            send_response_file(conn);
     }
 
-    // Строим полный путь
-    char full_path[PATH_MAX];
-    sprintf(full_path, "%s%s", STATIC_ROOT, path);
-
-    char resolved_path[PATH_MAX];
-    if (realpath(full_path, resolved_path) == NULL) {
-        send_error(client_socket, NOT_FOUND);
-        return OK;
-    }
-
-    // Защита от несанкционированного доступа
-    if (strncmp(resolved_path, STATIC_ROOT, strlen(STATIC_ROOT)) != 0) {
-        send_error(client_socket, FORBIDDEN);
-        return OK;
-    }
-
-    if (strcmp(path, "/") == 0) {
-        strcat(full_path, "index.html");
-    }
-
-    struct stat path_stat;
-    // Если это директория, отправляем список файлов и поддиректорий
-    if (stat(full_path, &path_stat) == 0 && S_ISDIR(path_stat.st_mode)) {
-        send_error(client_socket, NOT_FOUND);
-        return OK;
-    } else {
-        strncpy(req_filename, full_path, PATH_MAX);
-        strncpy(res_method, method, 10);
-    }
-
-    return OK;
+    return;
 }
 
 
-void send_headers(long file_size, char *file_path, int client_socket) {
+void send_response_headers(connection_t *conn, long file_size) {
+    log_message(LOG_STEPS, "send_response_headers()\n");
+
+    if (file_size < 0) {
+        if (get_file_size_with_open(conn, &file_size))
+            return;
+    }
+    
     char headers[1024];
     sprintf(headers, "HTTP/1.1 200 OK\r\nContent-Length: %ld\r\n", file_size);
 
     const char* content_type = "text/plain";
-    const char* file_ext = strrchr(file_path, '.');
+    const char* file_ext = strrchr(conn->path, '.');
+
     if (file_ext != NULL) {
         if (strcmp(file_ext, ".html") == 0) {
             content_type = "text/html";
@@ -121,54 +185,76 @@ void send_headers(long file_size, char *file_path, int client_socket) {
 
     sprintf(headers + strlen(headers), "Content-Type: %s\r\n\r\n", content_type);
 
-    send(client_socket, headers, strlen(headers), 0);
+    ssize_t sent_bytes = send(conn->socket, headers, strlen(headers), 0);
+    if (sent_bytes <= 0) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK) {
+            log_message(LOG_ERROR, "EAGAION or EWOULDBLOCK happend in send_response_headers()\n");
+            return;
+        }
+
+        log_message(LOG_ERROR, "Error while send() in send_response_headers(), sent %ld bytes\n", sent_bytes);
+        conn->state = ERROR;
+    } else {
+        log_message(LOG_INFO, "Successfully sent headers\n");
+        conn->state = COMPLETE;
+    }
 }
 
 
-int send_response(int client_socket, const char* file_path, const char* method, long *offset) {
-    FILE* file = fopen(file_path, "rb");
-    if (file == NULL) {
-        send_error(client_socket, NOT_FOUND);
+void send_response_file(connection_t *conn) {
+    log_message(LOG_STEPS, "send_response_file()\n");
+
+    int ok = read_file(conn);
+    if (!ok)
+        return;
+
+    if (conn->resp_buffer.offset == 0) {
+        send_response_headers(conn, conn->resp_buffer.total);
+        if (conn->state != COMPLETE)
+            return;
+    }
+
+    conn->state = READY_FOR_RESPONSE;
+
+    ssize_t sent_bytes = send(conn->socket, conn->resp_buffer.buffer + conn->resp_buffer.offset, RESPONSE_BLOCK_SIZE_BYTES, 0);
+
+    if (sent_bytes < 0) {
+        if(errno == EAGAIN || errno == EWOULDBLOCK) {
+            log_message(LOG_ERROR, "EAGAION or EWOULDBLOCK happend in send_response_headers()\n");
+            return;
+        }
+
+        log_message(LOG_ERROR, "Error while send() in send_response_file(), sent %ld bytes\n", sent_bytes);
+        conn->state = ERROR;
+
         return;
     }
 
-    fseek(file, 0, SEEK_END);
-    long file_size = ftell(file);
-
-    if (strcmp(method, "HEAD") == 0) {
-        send_headers(file_size, file_path, client_socket);
-    } else if (offset < file_size) {
-        // Если файл еще не передавался, передаем еще и заголовки сначала
-        if (*offset == 0) {
-            send_headers(file_size, file_path, client_socket);
-        }
-
-        // Отправка содержимого файла
-        long block_size = (file_size - *offset >= FILE_BLOCK_SIZE) ? FILE_BLOCK_SIZE : file_size - *offset;
-
-        fseek(file, *offset, SEEK_SET);
-        char buffer[block_size];
-
-        size_t bytes_read = fread(buffer, block_size, sizeof(buffer), file);
-        if (bytes_read > 0)
-            send(client_socket, buffer, bytes_read, 0);
-
-        *offset += block_size;
-
-        if (*offset == file_size)
-            *offset = 0;
+    log_message(LOG_INFO, "Successfully sent file part\n");
+    conn->resp_buffer.offset += sent_bytes;
+    
+    if (conn->resp_buffer.offset == conn->resp_buffer.total) {
+        log_message(LOG_INFO, "Successfully sent full file\n");
+        conn->state = COMPLETE;
     }
-
-    fclose(file);
 }
 
 
-void send_error(int client_socket, int status_code) {
+void send_error(connection_t *conn, int error) {
+    log_message(LOG_STEPS, "send_error()\n");
+
     char response[1024];
-    sprintf(response, "HTTP/1.1 %d\r\nContent-Length: 0\r\nContent-Type: text/html\r\n\r\n", status_code);
+    sprintf(response, "HTTP/1.1 %d\r\nContent-Length: 0\r\nContent-Type: text/html\r\n\r\n", error);
 
-    log_message(LOG_INFO, "ERROR %s\n", response);
-    log_message(LOG_DEBUG, "Debug message: %d\n", 42);
+    log_message(LOG_INFO, "HTTP ERROR %s\n", response);
 
-    send(client_socket, response, strlen(response), 0);
+    ssize_t sent_bytes = send(conn->socket, response, strlen(response), 0);
+
+    if (sent_bytes <= 0) {
+        log_message(LOG_ERROR, "Error while send() in send_error(), sent %ld bytes\n", sent_bytes);
+        conn->state = ERROR;
+    } else {
+        log_message(LOG_INFO, "Successfully sent error\n");
+        conn->state = COMPLETE;
+    }
 }
