@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <stdlib.h>
 
 #include "../inc/http.h"
 #include "../inc/myerrors.h"
@@ -40,6 +41,7 @@ int check_if_file(const char *path) {
 
     // Проверяем, что это файл (а не директория)
     if (S_ISREG(path_stat.st_mode)) {
+        log_message(LOG_INFO, "It is a file: %s\n", path);
         return 1;
     } else if (S_ISDIR(path_stat.st_mode)) {
         log_message(LOG_ERROR, "It is a directory, not a file: %s\n", path);
@@ -94,6 +96,7 @@ void parse_http_request(connection_t *conn) {
     log_message(LOG_DEBUG, "Static path: %s\n", static_path);
 
     int is_file = check_if_file(static_path);
+
     log_message(LOG_DEBUG, "is_file: %d\n", is_file);
 
     if (is_file != 1) {
@@ -104,7 +107,11 @@ void parse_http_request(connection_t *conn) {
         return;
     }
 
-    strncpy(conn->resp_buffer.buffer, static_path, PATH_MAX);
+    log_message(LOG_DEBUG, "If conn is not null: %d\n", conn != NULL);
 
+    strncpy(conn->path, static_path, PATH_MAX);
+    
+    log_message(LOG_DEBUG, "Path buffer in conn: %s\n", conn->path);
+    
     log_message(LOG_STEPS, "end parse_http_request()\n");
 }

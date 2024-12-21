@@ -1,3 +1,6 @@
+#define _POSIX_C_SOURCE 200112L
+
+
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
@@ -12,10 +15,17 @@
 #include <poll.h>
 #include <linux/limits.h>
 #include <string.h>
+#include <signal.h>
 
 #include "../inc/server.h"
 #include "../inc/myerrors.h"
 #include "../inc/handler.h"
+
+
+struct pollfd fds[MAX_CLIENTS];
+connection_t client_connections[MAX_CLIENTS];
+int nfds = 1;
+int worker_is_working = 1;
 
 
 int init_server(struct sockaddr_in *server_addr, int *server_socket) {
@@ -69,14 +79,29 @@ int init_server(struct sockaddr_in *server_addr, int *server_socket) {
 void add_new_client(struct pollfd *fds, connection_t *client_conns, int i, int new_conn) {
 	log_message(LOG_STEPS, "begin add_new_client()\n");
 
+	log_message(LOG_DEBUG, "i: %d, new_conn: %d\n", i, new_conn);
+
+	int flags = fcntl(new_conn, F_GETFL, 0);
+    if (flags == -1) {
+        log_message(LOG_ERROR, "Failed to get socket flags from new connection: %s\n", strerror(errno));
+        close(new_conn);
+        return;
+    }
+
+    if (fcntl(new_conn, F_SETFL, flags | O_NONBLOCK) == -1) {
+        log_message(LOG_ERROR, "Failed to set socket to non-blocking new connection: %s\n", strerror(errno));
+        close(new_conn);
+        return;
+    }
+
 	fds[i].fd = new_conn;
 	fds[i].events = POLLIN | POLLOUT;
 
-	client_conns[i - 1].state = READY_FOR_REQUEST;
-	client_conns[i - 1].socket = new_conn;
-	client_conns[i - 1].resp_buffer.offset = 0;
-	client_conns[i - 1].resp_buffer.total = 0;
-	client_conns[i - 1].resp_buffer.buffer = NULL;
+	client_conns[i].state = READY_FOR_REQUEST;
+	client_conns[i].socket = new_conn;
+	client_conns[i].resp_buffer.offset = 0;
+	client_conns[i].resp_buffer.total = 0;
+	client_conns[i].resp_buffer.buffer = NULL;
 
 	log_message(LOG_STEPS, "end add_new_client()\n");
 }
@@ -84,51 +109,95 @@ void add_new_client(struct pollfd *fds, connection_t *client_conns, int i, int n
 
 void close_client(struct pollfd *fds, connection_t *client_conns, int i) {
 	log_message(LOG_STEPS, "close_client()\n");
+	
 	log_message(LOG_INFO, "Close client's connections for client with fd = %d\n", fds[i].fd);
 	
 	close(fds[i].fd);
-	fds[i].fd = client_conns[i - 1].socket = -1;
-	free(client_conns[i - 1].resp_buffer.buffer);
+	fds[i].fd = -1;
+
+	shutdown(client_conns[i].socket, SHUT_RDWR);
+	client_conns[i].socket = -1;
+
+	free(client_conns[i].resp_buffer.buffer);
+	client_conns[i].resp_buffer.buffer = NULL;
 }
 
 
-int accept_new_clients(int server_socket, struct pollfd *fds, connection_t *client_conns, int *nfds) {
-	log_message(LOG_STEPS, "accept_new_clients()\n");
-	
-	int cur_clients = *nfds;
-	int error = OK;
+int accept_new_client(int server_socket, struct pollfd *fds, connection_t *client_conns, int *nfds) {
+    log_message(LOG_STEPS, "accept_new_clients()\n");
 
-	while (1) {
-        int new_conn = accept(server_socket, NULL, NULL);
+    int error = OK;
 
-        if (new_conn < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                // Нет больше новых соединений в очереди
-                break;
-            }
+    int new_conn = accept(server_socket, NULL, NULL);
+	log_message(LOG_DEBUG, "new_conn: %d\n", new_conn);
 
-            log_message(LOG_ERROR, "Error accepting new client: errno = %s\n", strerror(errno));
+    if (new_conn < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            log_message(LOG_DEBUG, "No pending connections in the accept queue\n");
+        } else {
+            log_message(LOG_ERROR, "Error accepting new client: %s\n", strerror(errno));
             error = ACCEPT_ERR;
-            break;
         }
-
-        if (cur_clients >= MAX_CLIENTS) {
-            log_message(LOG_WARNING, "Maximum number of clients reached, refusing new connection\n");
-            close(new_conn);
-            break;
-        }
-
-        add_new_client(fds, client_conns, cur_clients, new_conn);
-        cur_clients++;
-
-        log_message(LOG_INFO, "New client (number %d) is connected\n", cur_clients);
+        return error;
     }
 
+    if (*nfds > MAX_CLIENTS) {
+        log_message(LOG_WARNING, "Maximum number of clients reached, refusing new connection\n");
+        close(new_conn);
+        return error;
+    }
 
-	log_message(LOG_INFO, "Total new clients were connected: %d\n", cur_clients - *nfds);
-	*nfds = cur_clients;
+    add_new_client(fds, client_conns, *nfds, new_conn);
+    (*nfds)++;
 
-	return error;
+    log_message(LOG_INFO, "New client (number %d) is connected\n", *nfds);
+
+    return error;
+}
+
+
+void compress_arrays(struct pollfd *fds, connection_t *conns, int *nfds) {
+	int i = 0;
+	while (i < *nfds) {
+		if (fds[i].fd == -1) {
+			for (int j = i; j < *nfds - 1; j++) {
+				fds[j] = fds[j + 1];
+				conns[j] = conns[j + 1];
+			} 
+			(*nfds)--;
+		} else {
+			i++;
+		}
+	}		
+}
+
+
+void signal_handler(int signum, siginfo_t *info, void *context) {
+	int pid = getpid();
+	log_message(LOG_INFO, "Process with PID = %d is stopping...\n", pid);
+
+	// Параметры не используются мной, но нужны в соответствии с определения поля структуры struct sigaction.
+	// Отключать -Werror не хочу, поэтому делаю так, чтобы компилятор не ругался на неиспользуемые переменные.
+	log_message(LOG_INFO, "Params in signal_handler: signum = %d, siginfo = %d, context = %d\n", signum, info == NULL, context == NULL);
+
+	worker_is_working = 0;
+
+	log_message(LOG_INFO, "Process with PID = %d has stopped successfully\n", pid);
+}
+
+
+int handle_sigint(struct sigaction *sa) {
+	sa->sa_flags = SA_SIGINFO;
+	sa->sa_sigaction = signal_handler;
+	sa->sa_flags = 0;
+    sigemptyset(&sa->sa_mask);
+	
+	if (sigaction(SIGINT, sa, NULL) == -1) {
+		log_message(LOG_ERROR, "Error while sigaction: %s\n", strerror(errno));
+		return SIGACTION_ERR;
+	}
+
+	return OK;
 }
 
 
@@ -137,18 +206,14 @@ int worker(int server_socket) {
 
 	int error = OK;
 
-	struct pollfd fds[MAX_CLIENTS + 1];
-	connection_t client_connections[MAX_CLIENTS];
-	int nfds = 1;
-
 	fds[0].fd = server_socket;
 	fds[0].events = POLLIN;
-	for (int i = 1; i <= MAX_CLIENTS; i++)
+	for (int i = 1; i < MAX_CLIENTS; i++)
 		fds[i].fd = -1;
 
 	log_message(LOG_INFO, "Poll initialized successfully\n");
 
-	while (!error) {
+	while (!error && worker_is_working) {
 		int new_conn = poll(fds, nfds, TIMEOUT);
 
 		if (new_conn < 0) {
@@ -166,25 +231,33 @@ int worker(int server_socket) {
 				error = REVENT_ERR;
 				log_message(LOG_ERROR, "Unsupportable revents on server socket: %d\n", fds[0].revents);
 			} else {
-				error = accept_new_clients(server_socket, fds, client_connections, &nfds);
+				error = accept_new_client(server_socket, fds, client_connections, &nfds);
 			}
 		}
 
 		for (int i = 1; i < nfds; i++) {
-			// Если ничего не произошло на сокете
-			if (fds[0].revents == 0)
+			if (fds[i].revents == 0)
 				continue;
 
-			if (client_connections[i - 1].state != COMPLETE && client_connections[i - 1].state != ERROR) {
-				handle_client(client_connections);
+			log_message(LOG_DEBUG, "for cycle begin. i: %d, socket: %d\n", i, client_connections[i].socket);	
+			log_message(LOG_DEBUG, "State before handle_client(), state: %d, offset: %d, total: %d\n",
+				client_connections[i].state, client_connections[i].resp_buffer.offset, client_connections[i - 1].resp_buffer.total);
 
-				if (client_connections[i - 1].state == COMPLETE || client_connections[i - 1].state == ERROR)
-					close_client(fds, client_connections, i);
-			} else if (fds[i].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+			handle_client(&client_connections[i]);
+
+			log_message(LOG_DEBUG, "State after handle_client(), state: %d, offset: %d, total: %d\n",
+				client_connections[i].state, client_connections[i].resp_buffer.offset, client_connections[i - 1].resp_buffer.total);
+
+			if (client_connections[i].state == COMPLETE || client_connections[i].state == ERROR)
 				close_client(fds, client_connections, i);
-			}
 		}
+
+		compress_arrays(fds, client_connections, &nfds);
 	}
+
+	log_message(LOG_INFO, "Clean memory after work\n");
+	for (int i = 0; i < nfds; i++)
+		close_client(fds, client_connections, i);
 
 	return error;
 }
@@ -195,6 +268,11 @@ int server(void) {
     struct sockaddr_in server_addr;
 
 	int error = open_logs_files();
+	if (error)
+		return error;
+
+	struct sigaction sa;
+	error = handle_sigint(&sa);
 	if (error)
 		return error;
 

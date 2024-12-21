@@ -5,6 +5,8 @@
 typedef enum {
     OK,
 
+    SIGACTION_ERR,
+
     LOG_DIR_OPEN_ERR,
     MAIN_LOG_FILE_OPEN_ERR,
     STEPS_LOG_FILE_OPEN_ERR,

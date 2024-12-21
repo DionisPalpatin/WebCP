@@ -36,14 +36,17 @@ int open_logs_files(void) {
 }
 
 
-void log_message(LogLevel level, const char* format, ...) {
-    time_t rawtime;
-    struct tm* timeinfo;
-    time(&rawtime);
-    timeinfo = localtime(&rawtime);
-    LogLevel current_log_level = LOG_LEVEL;
-
-    if (level > current_log_level) { return; }
+void log_message(LogLevel level, const char* format, ...) {    
+    if (level == LOG_DEBUG && !DEBUG_LOGS_ALLOWED)
+        return;
+    else if (level == LOG_INFO && !INFO_LOGS_ALLOWED)
+        return;
+    else if (level == LOG_WARNING && !WARNING_LOGS_ALLOWED)
+        return;
+    else if (level == LOG_ERROR && !ERROR_LOGS_ALLOWED)
+        return;
+    else if (level == LOG_STEPS && !STEPS_LOGS_ALLOWED)
+        return;
 
     FILE *log_file;
     switch (level) {
@@ -64,34 +67,29 @@ void log_message(LogLevel level, const char* format, ...) {
             break;
     }
 
+    
+    time_t rawtime;
+    struct tm* timeinfo;
+    time(&rawtime);
+    timeinfo = localtime(&rawtime);
+
     char time_str[50];
     strftime(time_str, sizeof(time_str), "[%Y-%m-%d %H:%M:%S]", timeinfo);
 
     va_list args;
     va_start(args, format);
 
-    fprintf(log_file, "%s ", time_str);
+    const char *log_levels_in_file[] = {
+        "[DEBUG]",
+        "[INFO]",
+        "[WARNING]",
+        "[ERROR]",
+        "[STEPS]"
+    };
 
-    switch (level) {
-        case LOG_DEBUG:
-            fprintf(log_file, "[DEBUG] [pid %d] ", getpid());
-            break;
-        case LOG_INFO:
-            fprintf(log_file, "[INFO] [pid %d] ", getpid());
-            break;
-        case LOG_WARNING:
-            fprintf(log_file, "[WARNING] [pid %d] ", getpid());
-            break;
-        case LOG_ERROR:
-            fprintf(log_file, "[ERROR] [pid %d] ", getpid());
-            break;
-        case LOG_STEPS:
-            fprintf(log_file, "[STEP] [pid %d] ", getpid());
-            break;
-    }
-
+    fprintf(log_file, "%s %s [pid %d] ", time_str, log_levels_in_file[level], getpid());
     vfprintf(log_file, format, args);
+    fclose(log_file);
 
     va_end(args);
-    fclose(log_file);
 }
