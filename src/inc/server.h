@@ -15,7 +15,7 @@
 
 
 #define PORT            8800
-#define MAX_CLIENTS     1000
+#define MAX_CLIENTS     100000
 #define NUM_CHILDREN    5
 #define TIMEOUT         -1
 

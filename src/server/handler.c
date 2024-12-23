@@ -75,20 +75,9 @@ int read_file(connection_t *conn) {
         return -1;
     }
 
-    int error = get_file_size(fd, &conn->resp_buffer.total);
-    if (error) {
-        send_error(conn, INTERNAL_SERVER_ERROR);                
-        conn->state = ERROR;
-
-        close(fd);
-
-        return -1;
-    }
-    
-    conn->resp_buffer.buffer = malloc(conn->resp_buffer.total);
-    if (!conn->resp_buffer.buffer) {
-        log_message(LOG_ERROR, "Error while allocate memory for file buffer\n");
-        send_error(conn, INTERNAL_SERVER_ERROR);                
+    if (get_file_size(fd, &conn->resp_buffer.file_size)) {
+        log_message(LOG_ERROR, "Error while get file size: %s\n", strerror(errno));
+        send_error(conn, INTERNAL_SERVER_ERROR);
         conn->state = ERROR;
 
         close(fd);
@@ -96,7 +85,9 @@ int read_file(connection_t *conn) {
         return -1;
     }
 
-    ssize_t bytes = read(fd, conn->resp_buffer.buffer, conn->resp_buffer.total);
+    lseek(fd, conn->resp_buffer.offset, SEEK_SET);
+
+    ssize_t bytes = read(fd, conn->resp_buffer.buffer, RESPONSE_BLOCK_SIZE_BYTES);
     if (bytes < 0) {
         log_message(LOG_ERROR, "Error while reading file: %s\n", strerror(errno));
         send_error(conn, INTERNAL_SERVER_ERROR);
@@ -105,14 +96,8 @@ int read_file(connection_t *conn) {
         close(fd);
 
         return -1;
-    } else if (bytes < conn->resp_buffer.total) {
-        log_message(LOG_ERROR, "Incomplete read: expected %ld bytes, got %ld bytes\n", conn->resp_buffer.total, bytes);
-        send_error(conn, INTERNAL_SERVER_ERROR);
-        conn->state = ERROR;
-
-        close(fd);
-
-        return -1;
+    } else {
+        conn->resp_buffer.total = bytes;
     }
 
     close(fd);
@@ -148,7 +133,10 @@ void read_request(connection_t *conn) {
     }
 
     ssize_t recv_bytes = recv(conn->socket, conn->req_buffer.buffer, MAX_REQUEST_SIZE_BYTES, 0);
-    if (recv_bytes <= 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        log_message(LOG_DEBUG, "No data available yet for reading\n");
+        return;
+    } else if (recv_bytes <= 0) {
         log_message(LOG_ERROR, "Receive HTTP request failed: %s\n", strerror(errno));
         conn->state = ERROR;
         return;
@@ -235,13 +223,16 @@ void send_response_headers(connection_t *conn, long file_size) {
 void send_response_file(connection_t *conn) {
     log_message(LOG_STEPS, "BEGIN send_response_file()\n");
 
-    if (conn->resp_buffer.buffer == NULL && read_file(conn))
+    if (conn->resp_buffer.buffer == NULL)
+        return;
+
+    if (read_file(conn))
         return;
 
     log_message(LOG_DEBUG, "send_response_file(), offset: %d, total: %d\n", conn->resp_buffer.offset, conn->resp_buffer.total);    
 
     if (conn->resp_buffer.offset == 0) {
-        send_response_headers(conn, conn->resp_buffer.total);
+        send_response_headers(conn, conn->resp_buffer.file_size);
         if (conn->state != COMPLETE)
             return;
     }
@@ -250,7 +241,7 @@ void send_response_file(connection_t *conn) {
 
     size_t send_buf_len = RESPONSE_BLOCK_SIZE_BYTES;
     if (conn->resp_buffer.total - conn->resp_buffer.offset < RESPONSE_BLOCK_SIZE_BYTES)
-        send_buf_len = conn->resp_buffer.total - conn->resp_buffer.offset;
+        send_buf_len = conn->resp_buffer.file_size - conn->resp_buffer.offset;
 
     ssize_t sent_bytes = send(conn->socket, conn->resp_buffer.buffer + conn->resp_buffer.offset, send_buf_len, 0);
 
@@ -269,7 +260,7 @@ void send_response_file(connection_t *conn) {
     log_message(LOG_INFO, "Successfully sent file part\n");
     conn->resp_buffer.offset += sent_bytes;
     
-    if (conn->resp_buffer.offset == conn->resp_buffer.total) {
+    if (conn->resp_buffer.offset == conn->resp_buffer.file_size) {
         log_message(LOG_INFO, "Successfully sent full file\n");
         conn->state = COMPLETE;
     }

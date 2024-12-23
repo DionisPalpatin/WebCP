@@ -17,10 +17,10 @@ typedef enum {
 
 
 #define DEBUG_LOGS_ALLOWED 0
-#define INFO_LOGS_ALLOWED 1
+#define INFO_LOGS_ALLOWED 0
 #define WARNING_LOGS_ALLOWED 0
 #define ERROR_LOGS_ALLOWED 1
-#define STEPS_LOGS_ALLOWED 1
+#define STEPS_LOGS_ALLOWED 0
 
 
 #define LOG_DIR     "./logs"

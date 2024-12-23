@@ -22,9 +22,6 @@
 #include "../inc/handler.h"
 
 
-struct pollfd fds[MAX_CLIENTS];
-connection_t client_connections[MAX_CLIENTS];
-int nfds = 1;
 int worker_is_working = 1;
 
 
@@ -37,19 +34,6 @@ int init_server(struct sockaddr_in *server_addr, int *server_socket) {
 	if ((*server_socket = socket(AF_INET, SOCK_STREAM, 0)) == -1) {
 		log_message(LOG_ERROR, "Error init server socket: errno = %s\n", strerror(errno));
 		error = SOCKET_ERR;
-	}
-
-	int enable = 1;
-	if (!error && setsockopt(*server_socket, SOL_SOCKET,  SO_REUSEADDR, (char *)&enable, sizeof(enable)) < 0)
-	{
-		log_message(LOG_ERROR, "Error while setsockopt() in init_server(): errno = %s\n", strerror(errno));
-		error = SOCK_OPTS_ERR;
-	}
-
-	int flags = fcntl(*server_socket, F_GETFL, 0);
-	if (!error && fcntl(*server_socket, F_SETFL, flags | O_NONBLOCK) < 0) {
-		log_message(LOG_ERROR, "Error while set nonblocking status for server socket in init_server(): errno = %s\n", strerror(errno));
-		error = SET_NONBLOCKING_ERR;
 	}
 
 	server_addr->sin_family = AF_INET;
@@ -81,27 +65,20 @@ void add_new_client(struct pollfd *fds, connection_t *client_conns, int i, int n
 
 	log_message(LOG_DEBUG, "i: %d, new_conn: %d\n", i, new_conn);
 
-	int flags = fcntl(new_conn, F_GETFL, 0);
-    if (flags == -1) {
-        log_message(LOG_ERROR, "Failed to get socket flags from new connection: %s\n", strerror(errno));
-        close(new_conn);
-        return;
-    }
-
-    if (fcntl(new_conn, F_SETFL, flags | O_NONBLOCK) == -1) {
-        log_message(LOG_ERROR, "Failed to set socket to non-blocking new connection: %s\n", strerror(errno));
-        close(new_conn);
-        return;
-    }
-
 	fds[i].fd = new_conn;
 	fds[i].events = POLLIN | POLLOUT;
 
 	client_conns[i].state = READY_FOR_REQUEST;
 	client_conns[i].socket = new_conn;
 	client_conns[i].resp_buffer.offset = 0;
-	client_conns[i].resp_buffer.total = 0;
-	client_conns[i].resp_buffer.buffer = NULL;
+	client_conns[i].resp_buffer.total = RESPONSE_BLOCK_SIZE_BYTES;
+
+	client_conns[i].resp_buffer.buffer = malloc(client_conns[i].resp_buffer.total * sizeof(char));
+	client_conns[i].path = malloc(sizeof(char) * PATH_MAX);
+	client_conns[i].req_buffer.buffer = malloc(sizeof(char) * MAX_REQUEST_SIZE_BYTES);
+
+	if (!client_conns[i].resp_buffer.buffer || !client_conns[i].path || client_conns[i].req_buffer.buffer)
+		log_message(LOG_ERROR, "Memory allocating error, path = %d, buffer = %d\n", !client_conns[i].path, client_conns[i].req_buffer.buffer);
 
 	log_message(LOG_STEPS, "end add_new_client()\n");
 }
@@ -112,14 +89,19 @@ void close_client(struct pollfd *fds, connection_t *client_conns, int i) {
 	
 	log_message(LOG_INFO, "Close client's connections for client with fd = %d\n", fds[i].fd);
 	
-	close(fds[i].fd);
-	fds[i].fd = -1;
-
 	shutdown(client_conns[i].socket, SHUT_RDWR);
+	close(fds[i].fd);
+
+	fds[i].fd = -1;
 	client_conns[i].socket = -1;
 
 	free(client_conns[i].resp_buffer.buffer);
+	free(client_conns[i].path);
+	free(client_conns[i].req_buffer.buffer);
+
 	client_conns[i].resp_buffer.buffer = NULL;
+	client_conns[i].path = NULL;
+	client_conns[i].req_buffer.buffer = NULL;
 }
 
 
@@ -127,17 +109,11 @@ int accept_new_client(int server_socket, struct pollfd *fds, connection_t *clien
     log_message(LOG_STEPS, "accept_new_clients()\n");
 
     int error = OK;
-
     int new_conn = accept(server_socket, NULL, NULL);
 	log_message(LOG_DEBUG, "new_conn: %d\n", new_conn);
 
     if (new_conn < 0) {
-        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            log_message(LOG_DEBUG, "No pending connections in the accept queue\n");
-        } else {
-            log_message(LOG_ERROR, "Error accepting new client: %s\n", strerror(errno));
-            error = ACCEPT_ERR;
-        }
+		log_message(LOG_ERROR, "Error accepting new client: %s\n", strerror(errno));
         return error;
     }
 
@@ -206,6 +182,12 @@ int worker(int server_socket) {
 
 	int error = OK;
 
+    // struct pollfd fds[MAX_CLIENTS];
+    // connection_t client_connections[MAX_CLIENTS];
+	struct pollfd *fds = malloc((MAX_CLIENTS + 1) * sizeof(struct pollfd));
+    connection_t *client_connections = malloc((MAX_CLIENTS + 1) * sizeof(connection_t));
+    int nfds = 1;
+
 	fds[0].fd = server_socket;
 	fds[0].events = POLLIN;
 	for (int i = 1; i < MAX_CLIENTS; i++)
@@ -213,11 +195,14 @@ int worker(int server_socket) {
 
 	log_message(LOG_INFO, "Poll initialized successfully\n");
 
-	while (!error && worker_is_working) {
+	while (!error) {
 		int new_conn = poll(fds, nfds, TIMEOUT);
 
+		if (!worker_is_working)
+			break;
+
 		if (new_conn < 0) {
-			log_message(LOG_ERROR, "poll() error in worker()\n");
+			log_message(LOG_ERROR, "poll() error in worker(): %s\n", strerror(errno));
 			error = FORK_ERR;
 			continue;
 		} else if (new_conn == 0) {
@@ -226,15 +211,9 @@ int worker(int server_socket) {
 			continue;
 		}
 
-		if (fds[0].revents != 0) {
-			if ((fds[0].revents & POLLIN) == 0) {
-				error = REVENT_ERR;
-				log_message(LOG_ERROR, "Unsupportable revents on server socket: %d\n", fds[0].revents);
-			} else {
+		if (fds[0].revents != 0)
 				error = accept_new_client(server_socket, fds, client_connections, &nfds);
-			}
-		}
-
+				
 		for (int i = 1; i < nfds; i++) {
 			if (fds[i].revents == 0)
 				continue;
@@ -255,9 +234,14 @@ int worker(int server_socket) {
 		compress_arrays(fds, client_connections, &nfds);
 	}
 
+	log_message(LOG_ERROR, "Error after all: %d", error);
+
 	log_message(LOG_INFO, "Clean memory after work\n");
-	for (int i = 0; i < nfds; i++)
+	for (int i = 0; i < MAX_CLIENTS + 1; i++)
 		close_client(fds, client_connections, i);
+
+	free(fds);
+	free(client_connections);	
 
 	return error;
 }

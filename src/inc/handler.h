@@ -30,11 +30,13 @@ typedef struct {
     char *buffer;
     long offset;
     long total;
+    long file_size;
 } response_buffer_t;
 
 
 typedef struct {
-    char buffer[MAX_REQUEST_SIZE_BYTES];
+    // char buffer[MAX_REQUEST_SIZE_BYTES];
+    char *buffer;
 } request_buffer_t;
 
 
@@ -42,7 +44,8 @@ typedef struct {
     response_buffer_t resp_buffer;
     request_buffer_t req_buffer;
 
-    char path[PATH_MAX];
+    // char path[PATH_MAX];
+    char *path;
     methods_t method;
 
     int state;
